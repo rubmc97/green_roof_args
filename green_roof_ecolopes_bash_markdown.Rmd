@@ -1,0 +1,276 @@
+---
+title: "Green roof exp | ECOLOPES | BASH"
+author: "Ruben Martinez"
+date: "2025-08-05"
+output: html_document
+---
+flow-cell: FLO-MIN114
+kit: SQK-NBD114-96
+
+All of the mentioned commands were stored in .sbatch files, and ran with the following settings:
+```{bash}
+#!/bin/bash
+#
+#SBATCH --ntasks=1
+#SBATCH -J whatever_the_pipeline
+#SBATCH -o o_%x_%J.txt
+#SBATCH -e e_%x_%J.txt
+#SBATCH -p gpu_p
+#SBATCH -q gpu_normal
+#SBATCH --cpus-per-task=20
+#SBATCH --gres=gpu:2
+#SBATCH --mem=200G
+#SBATCH -t 24:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=ruben.martinezcuesta@helmholtz-munich.de
+
+source /home/comi/ruben.martinez/tools/apps/mamba/etc/profile.d/conda.sh
+```
+
+Basecalling with Dorado:
+```{bash}
+#Running Dorado stored in a common directory
+/lustre/groups/comi/tools/dorado-0.9.5-linux-x64/bin/dorado basecaller hac /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/greenroof_dataset/pod5 --kit-name SQK-NBD114-96 \
+--no-trim \
+--device cuda:0,1 > /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_0425.bam
+```
+
+Demultiplexing with Dorado:
+```{bash}
+/lustre/groups/comi/tools/dorado-0.9.5-linux-x64/bin/dorado demux /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_0425.bam \
+--output-dir /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_demux_0425 \
+--no-classify \
+--emit-fastq
+```
+
+Plotting quality with Nanoplot:
+```{bash}
+source /lustre/groups/comi/tools/miniconda3/etc/profile.d/conda.sh
+
+conda activate nanoplot
+
+for file in /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_demux_0425/*.fastq; do
+  # Extract the base name of the file (without .fastq extension)
+  base_name="${file%.fastq}"
+  
+  # Run Nanoplot on the file and output to a new file with _trimmed suffix
+  NanoPlot --fastq "$file" -o nanoplot_quality --plots dot --legacy hex -p "$file"
+  
+done
+```
+
+Trimming of ONT adapters with Porechop
+```{bash}
+#With Porechop installed as a conda env
+source /lustre/groups/comi/tools/miniconda3/etc/profile.d/conda.sh
+
+conda activate porechop
+
+for file in /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_demux_0425\*.fastq; do
+  # Extract the base name of the file (without .fastq extension)
+  base_name="${file%.fastq}"
+  
+  # Run Porechop on the file and output to a new file with _trimmed suffix
+  porechop -i "$file" -o "${base_name}_trimmed.fastq" -v 1
+  
+done
+
+mkdir /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_demux_0425/trimmed
+mv *_trimmed.fastq /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_demux_0425/trimmed
+```
+
+Quality filtering with Chopper
+```{bash}
+#With chopper installed in a conda env
+source /lustre/groups/comi/tools/miniconda3/etc/profile.d/conda.sh
+
+conda activate chopper
+
+for file in /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_demux_0425/trimmed/*.fastq; do
+  #Extract the base name of the file (without .fastq extension)
+ base_name=${file%.fastq}
+
+chopper --quality 10 --minlength 500 --threads 10 -i $file > ${base_name}_filt.fastq
+
+done
+
+mkdir /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_demux_0425\trimmed/filtered
+mv *_filt.fastq /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_demux_0425/trimmed/filtered
+```
+
+```{bash}
+#With argo installed in a conda env
+source /lustre/groups/comi/tools/miniconda3/etc/profile.d/conda.sh
+
+conda activate argo
+
+for file in *_trimmed_filt.fastq; do
+  # Extract the base name of the file (without .fastq extension)
+  base_name=${file%_trimmed_filt.fastq}
+
+  argo "$file" -d /lustre/groups/comi/tools/databases/argo_db -o "${base_name}_argo" --plasmid
+  
+done
+
+mkdir /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_demux_0425/trimmed/filtered/argo
+mv *argo* /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_demux_0425/trimmed/filtered/argo
+```
+
+Create python script to extract the read ID of the ARGs detected with Argo:
+```{python}
+import json
+import os
+
+# Get all .json files in the current directory
+json_files = [f for f in os.listdir(".") if f.endswith(".json")]
+
+for json_file in json_files:
+    try:
+        with open(json_file) as f:
+            data = json.load(f)
+
+        # Extract read IDs with remark "ARG-containing"
+        arg_read_ids = [
+            read_id for read_id, info in data.items()
+            if isinstance(info, dict) and info.get("remark") == "ARG-containing"
+        ]
+
+        # Construct output filename based on the input JSON name
+        base_name = os.path.splitext(json_file)[0]
+        output_filename = f"arg_read_ids_{base_name}.txt"
+
+        # Write to output file
+        with open(output_filename, "w") as out:
+            for read_id in arg_read_ids:
+                out.write(read_id + "\n")
+
+        print(f"{json_file}: Extracted {len(arg_read_ids)} ARG-containing read IDs → {output_filename}")
+
+    except Exception as e:
+        print(f"Error processing {json_file}: {e}")
+```
+
+```{bash}
+#save the above in extract_ARGs_read_id.py
+nano extract_ARGs_read_id.py
+
+mkdir /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_demux_0425/trimmed/filtered/argo/args
+mv *arg_read_ids* /project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_demux_0425/trimmed/filtered/argo/args
+```
+
+Filter .fastq files keeping the reads containing ARGs:
+```{bash}
+git clone https://github.com/lh3/seqtk.git;
+cd seqtk; make
+
+seqtk reads.fastq arg_contig_ids.txt > arg_reads.fastq
+```
+
+Taxonmically classify the reads containing ARGs using Centrifuger:
+```{bash}
+source /lustre/groups/comi/tools/miniconda3/etc/profile.d/conda.sh
+
+conda activate centrifuger
+
+# Folder with the fastq files
+input_dir=/project/genomics/Nanopore_data/2025_01_22_P2Blik_Ruben_1/gr_pool_demux_0425/trimmed/filtered/argo/args
+# Centrifuge database
+db=/lustre/groups/comi/tools/databases/gtdb/release226/cfr_gtdb_r226
+# Output folder (optional, here same as input)
+output_dir="$input_dir"
+
+#Loop over all fastq files
+for fq in "$input_dir"/*.fastq; do
+    #Extract base filename without path and extension
+    base=$(basename "$fq" .fastq)
+    #Run centrifuger and save output
+    centrifuger -x "$db" -t 6 -u "$fq" > "$output_dir/centrifuger_${base}.tsv"
+    done
+    
+# Loop over the tsv files
+for ts in "$input_dir"/*.tsv; do
+    # Extract base filename without path and extension
+    base=$(basename "$ts" .tsv)
+    # Run centrifuger and save output
+    centrifuger-quant -x "$db" -c "$ts" --output-format 1 > "$output_dir/report_${base}.tsv"
+    done
+```
+
+Create python script to merge the ARGs with the taxonomy obtained with Centrifuger:
+```{python}
+#!/usr/bin/env python3
+import argparse
+import json
+
+def normalize_readid(r):
+    if r is None:
+        return r
+    r = r.strip()
+    # remove trailing /1 or /2 (common in paired FASTQ IDs)
+    if r.endswith('/1') or r.endswith('/2'):
+        return r[:-2]
+    return r
+
+def load_arg_json(path):
+    with open(path, 'r', encoding='utf-8') as fh:
+        data = json.load(fh)
+    arg_map = {}
+    for rid, info in data.items():
+        hits = info.get('hit', [])
+        summary = ";".join(hits) if hits else "No_ARG_Hit"
+        arg_map[rid] = summary
+        arg_map[normalize_readid(rid)] = summary
+    return arg_map
+
+def process_centrifuge(cent_path, arg_map):
+    with open(cent_path, 'r', encoding='utf-8') as fh:
+        first = fh.readline()
+        if not first:
+            return
+        first = first.rstrip('\n')
+        toks = first.split()
+        # detect header (first token equals 'readID' or similar)
+        is_header = bool(toks) and toks[0].lower().startswith('readid')
+        if is_header:
+            # print header + new column name
+            print(first + '\tARG_Hit')
+        else:
+            # first line is actual data -> process it
+            arg_hit = get_arg_for_line(first, arg_map)
+            print(first + '\t' + arg_hit)
+
+        # remaining lines
+        for line in fh:
+            line = line.rstrip('\n')
+            if not line:
+                continue
+            arg_hit = get_arg_for_line(line, arg_map)
+            print(line + '\t' + arg_hit)
+
+def get_arg_for_line(line, arg_map):
+    # preserve splitting by tab
+    parts = line.split('\t') if '\t' in line else line.split()
+    read_id = parts[0].strip() if parts else ""
+    # lookup raw, then normalized; else No_ARG_Hit
+    return arg_map.get(read_id, arg_map.get(normalize_readid(read_id), "No_ARG_Hit"))
+
+def main():
+    p = argparse.ArgumentParser(description="Append ARG hits from profiler JSON to Centrifuger TSV by readID")
+    p.add_argument('centrifuger_tsv', help="Centrifuger TSV (readID in first column)")
+    p.add_argument('arg_json', help="ARG profiler JSON (top-level keys = readIDs)")
+    args = p.parse_args()
+
+    arg_map = load_arg_json(args.arg_json)
+    process_centrifuge(args.centrifuger_tsv, arg_map)
+
+if __name__ == '__main__':
+    main()
+```
+
+```{bash}
+#save the above in args_with_tax.py
+nano args_with_tax.py
+
+#run args_with_tax.py for each centrifuger and arg_json of argo
+python args_with_tax.py report_centrifuger.tsv arg_hits.json > args_with_tax.tsv
+```
